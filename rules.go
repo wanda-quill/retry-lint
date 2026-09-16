@@ -1,8 +1,10 @@
 package retrylint
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
+	"strconv"
 )
 
 // boundingOperators are comparisons that plausibly gate a loop on an
@@ -66,6 +68,193 @@ func checkFixedDelay(fset *token.FileSet, loop *ast.ForStmt) []Finding {
 		return true
 	})
 	return findings
+}
+
+// nonRetryableContextErrors maps the context package's sentinel errors to
+// a human-readable reason. Both mean the caller gave up or the deadline
+// passed; retrying does nothing but waste the remaining budget.
+var nonRetryableContextErrors = map[string]string{
+	"Canceled":         "the context was canceled",
+	"DeadlineExceeded": "the context deadline was exceeded",
+}
+
+// nonRetryable4xxStatus lists client-error status codes that describe a
+// problem with the request itself, so a retry with the same request will
+// fail the same way every time. 429 (Too Many Requests) is left out on
+// purpose: unlike the rest of the 4xx range, it is meant to be retried,
+// typically after the delay in a Retry-After header.
+var nonRetryable4xxStatus = map[int]bool{
+	400: true, 401: true, 403: true, 404: true, 405: true, 406: true,
+	409: true, 410: true, 411: true, 412: true, 413: true, 414: true,
+	415: true, 416: true, 417: true, 422: true, 451: true,
+}
+
+// httpStatusConst maps the net/http status constant names that show up in
+// this range to their numeric value, since the AST only gives us the name.
+var httpStatusConst = map[string]int{
+	"StatusBadRequest":                   400,
+	"StatusUnauthorized":                 401,
+	"StatusForbidden":                    403,
+	"StatusNotFound":                     404,
+	"StatusMethodNotAllowed":             405,
+	"StatusNotAcceptable":                406,
+	"StatusConflict":                     409,
+	"StatusGone":                         410,
+	"StatusLengthRequired":               411,
+	"StatusPreconditionFailed":           412,
+	"StatusRequestEntityTooLarge":        413,
+	"StatusRequestURITooLong":            414,
+	"StatusUnsupportedMediaType":         415,
+	"StatusRequestedRangeNotSatisfiable": 416,
+	"StatusExpectationFailed":            417,
+	"StatusUnprocessableEntity":          422,
+	"StatusUnavailableForLegalReasons":   451,
+	"StatusTooManyRequests":              429,
+}
+
+// checkRetryOnNonRetryable flags an `if` inside a loop that recognizes a
+// non-retryable outcome (a canceled context, a 4xx response) but whose
+// body doesn't exit the loop, meaning execution falls through to the
+// retry logic anyway. The check only looks at the shape of the branch,
+// not what runs before or after it, so it catches the bug even in loops
+// that are otherwise correctly bounded and backed off.
+func checkRetryOnNonRetryable(fset *token.FileSet, loop *ast.ForStmt) []Finding {
+	var findings []Finding
+	inspectShallow(loop.Body, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		reason, ok := nonRetryableReason(ifStmt.Cond)
+		if !ok || blockExits(ifStmt.Body) {
+			return true
+		}
+		pos := fset.Position(ifStmt.Pos())
+		findings = append(findings, Finding{
+			Rule:    "retry-on-non-retryable-error",
+			Message: fmt.Sprintf("retries even when %s, which should not be retried", reason),
+			Line:    pos.Line,
+			Column:  pos.Column,
+		})
+		return true
+	})
+	return findings
+}
+
+// nonRetryableReason reports whether cond checks for a known non-retryable
+// condition, and if so, a human-readable reason describing it.
+func nonRetryableReason(cond ast.Expr) (string, bool) {
+	switch c := cond.(type) {
+	case *ast.BinaryExpr:
+		if c.Op != token.EQL {
+			return "", false
+		}
+		if reason, ok := contextErrorReason(c.X); ok {
+			return reason, true
+		}
+		if reason, ok := contextErrorReason(c.Y); ok {
+			return reason, true
+		}
+		if reason, ok := statusCodeReason(c.X, c.Y); ok {
+			return reason, true
+		}
+		return statusCodeReason(c.Y, c.X)
+	case *ast.CallExpr:
+		sel, ok := c.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Is" || len(c.Args) != 2 {
+			return "", false
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "errors" {
+			return "", false
+		}
+		return contextErrorReason(c.Args[1])
+	}
+	return "", false
+}
+
+func contextErrorReason(expr ast.Expr) (string, bool) {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	if !ok || pkg.Name != "context" {
+		return "", false
+	}
+	reason, ok := nonRetryableContextErrors[sel.Sel.Name]
+	return reason, ok
+}
+
+// statusCodeReason checks whether field is a "....StatusCode" selector and
+// value names a non-retryable 4xx status, either as an http.StatusXxx
+// constant or an integer literal.
+func statusCodeReason(field, value ast.Expr) (string, bool) {
+	sel, ok := field.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "StatusCode" {
+		return "", false
+	}
+	code, ok := statusCodeValue(value)
+	if !ok || !nonRetryable4xxStatus[code] {
+		return "", false
+	}
+	return fmt.Sprintf("the response status was %d", code), true
+}
+
+func statusCodeValue(expr ast.Expr) (int, bool) {
+	switch v := expr.(type) {
+	case *ast.SelectorExpr:
+		pkg, ok := v.X.(*ast.Ident)
+		if !ok || pkg.Name != "http" {
+			return 0, false
+		}
+		code, ok := httpStatusConst[v.Sel.Name]
+		return code, ok
+	case *ast.BasicLit:
+		if v.Kind != token.INT {
+			return 0, false
+		}
+		n, err := strconv.Atoi(v.Value)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+// blockExits reports whether block's last statement unconditionally leaves
+// the loop (return, break, goto, panic, os.Exit) rather than falling
+// through to whatever runs next, including a `continue` back to the top.
+func blockExits(block *ast.BlockStmt) bool {
+	if len(block.List) == 0 {
+		return false
+	}
+	return stmtExits(block.List[len(block.List)-1])
+}
+
+func stmtExits(stmt ast.Stmt) bool {
+	switch s := stmt.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return s.Tok == token.BREAK || s.Tok == token.GOTO
+	case *ast.ExprStmt:
+		call, ok := s.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "panic" {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		return ok && pkg.Name == "os" && sel.Sel.Name == "Exit"
+	default:
+		return false
+	}
 }
 
 func containsSleepCall(body ast.Node) bool {

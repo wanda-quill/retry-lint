@@ -40,6 +40,7 @@ func Analyze(filename string, src []byte) ([]Finding, error) {
 		}
 		findings = append(findings, checkUnboundedRetry(fset, loop)...)
 		findings = append(findings, checkFixedDelay(fset, loop)...)
+		findings = append(findings, checkRetryOnNonRetryable(fset, loop)...)
 		return true
 	})
 

@@ -1,7 +1,7 @@
 # retry-lint
 
 A static linter for Go that looks specifically at retry loops. It parses
-source files with `go/parser` and flags two shapes that look fine in a code
+source files with `go/parser` and flags shapes that look fine in a code
 review but cause real incidents in production:
 
 - **Unbounded retries.** A `for { ... }` loop that sleeps between attempts
@@ -11,6 +11,10 @@ review but cause real incidents in production:
   client that hit the same failure retries on the same clock, so they all
   come back at once and take the dependency down again the moment it
   recovers.
+- **Retrying a non-retryable error.** A branch that recognizes a canceled
+  context or a 4xx response but doesn't return or break, so execution
+  falls through into the retry logic anyway. The request will fail the
+  same way on every attempt; retrying just burns the time budget.
 
 It does not type-check your code or resolve imports, so it never needs your
 module's dependencies to run — it only reads syntax.
@@ -60,8 +64,13 @@ dropped into a CI step the same way as `go vet`.
   from the bound check, because `err == nil` and `err != nil` are the most
   common comparisons inside a retry loop and would otherwise make almost
   every unbounded loop look bounded.
-- Retrying on errors that should never be retried, like a cancelled
-  context or a 4xx response.
+- Non-retryable errors that aren't a direct `== context.Canceled` /
+  `== context.DeadlineExceeded` comparison, an `errors.Is` call against
+  one of those, or an equality check against a `StatusCode` field. A
+  wrapped error compared with `errors.Is` against something else, or a
+  status range check like `code >= 400 && code < 500`, isn't recognized.
+  429 is deliberately treated as retryable, not flagged, since it's the
+  one 4xx status meant to be retried.
 
 ## Library use
 

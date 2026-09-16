@@ -199,6 +199,159 @@ func ready() bool { return true }
 			want: nil,
 		},
 		{
+			name: "a canceled context falls through to the retry instead of returning",
+			src: `package sample
+
+import (
+	"context"
+	"time"
+)
+
+func retry(ctx context.Context) error {
+	attempts := 0
+	for {
+		attempts++
+		if attempts > 5 {
+			return errRetriesExhausted
+		}
+		err := attempt(ctx)
+		if err == context.Canceled {
+			time.Sleep(backoff(attempts))
+			continue
+		}
+		if err == nil {
+			return nil
+		}
+		time.Sleep(backoff(attempts))
+	}
+}
+
+func attempt(ctx context.Context) error { return nil }
+func backoff(n int) time.Duration       { return time.Duration(n) * time.Second }
+`,
+			want: []Finding{
+				{Rule: "retry-on-non-retryable-error", Message: "retries even when the context was canceled, which should not be retried", Line: 16, Column: 3},
+			},
+		},
+		{
+			name: "a canceled context that returns immediately is not flagged",
+			src: `package sample
+
+import (
+	"context"
+	"time"
+)
+
+func retry(ctx context.Context) error {
+	for attempts := 0; attempts < 5; attempts++ {
+		err := attempt(ctx)
+		if err == context.Canceled {
+			return err
+		}
+		if err == nil {
+			return nil
+		}
+		time.Sleep(backoff(attempts))
+	}
+	return errRetriesExhausted
+}
+
+func attempt(ctx context.Context) error { return nil }
+func backoff(n int) time.Duration       { return time.Duration(n) * time.Second }
+`,
+			want: nil,
+		},
+		{
+			name: "errors.Is against a canceled context is recognized the same as direct comparison",
+			src: `package sample
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+func retry(ctx context.Context) error {
+	for attempts := 0; attempts < 5; attempts++ {
+		err := attempt(ctx)
+		if errors.Is(err, context.Canceled) {
+			time.Sleep(backoff(attempts))
+			continue
+		}
+	}
+	return nil
+}
+
+func attempt(ctx context.Context) error { return nil }
+func backoff(n int) time.Duration       { return time.Duration(n) * time.Second }
+`,
+			want: []Finding{
+				{Rule: "retry-on-non-retryable-error", Message: "retries even when the context was canceled, which should not be retried", Line: 12, Column: 3},
+			},
+		},
+		{
+			name: "a 404 response falls through to the retry instead of giving up",
+			src: `package sample
+
+import (
+	"net/http"
+	"time"
+)
+
+func retry(url string) (*http.Response, error) {
+	for attempts := 0; attempts < 5; attempts++ {
+		resp, err := http.Get(url)
+		if err != nil {
+			time.Sleep(backoff(attempts))
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			time.Sleep(backoff(attempts))
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+	}
+	return nil, errRetriesExhausted
+}
+
+func backoff(n int) time.Duration { return time.Duration(n) * time.Second }
+`,
+			want: []Finding{
+				{Rule: "retry-on-non-retryable-error", Message: "retries even when the response status was 404, which should not be retried", Line: 15, Column: 3},
+			},
+		},
+		{
+			name: "a 429 response is deliberately not flagged, unlike the rest of the 4xx range",
+			src: `package sample
+
+import (
+	"net/http"
+	"time"
+)
+
+func retry(url string) (*http.Response, error) {
+	for attempts := 0; attempts < 5; attempts++ {
+		resp, err := http.Get(url)
+		if err != nil {
+			time.Sleep(backoff(attempts))
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			time.Sleep(backoff(attempts))
+			continue
+		}
+		return resp, nil
+	}
+	return nil, errRetriesExhausted
+}
+
+func backoff(n int) time.Duration { return time.Duration(n) * time.Second }
+`,
+			want: nil,
+		},
+		{
 			name:    "invalid syntax is reported as an error, not a panic",
 			src:     "package sample\n\nfunc broken( {\n",
 			wantErr: true,
