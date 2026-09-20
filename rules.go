@@ -55,7 +55,7 @@ func checkFixedDelay(fset *token.FileSet, loop *ast.ForStmt) []Finding {
 		if !ok || !isTimeSleepCall(call) || len(call.Args) != 1 {
 			return true
 		}
-		if argIsComputed(call.Args[0]) {
+		if argIsComputed(call.Args[0], loop.Body) {
 			return true
 		}
 		pos := fset.Position(call.Pos())
@@ -296,14 +296,61 @@ func isTimeSleepCall(call *ast.CallExpr) bool {
 	return ok && pkg.Name == "time"
 }
 
-// argIsComputed reports whether expr contains a function call anywhere in
-// it. Unlike inspectShallow, this walks the full expression tree: an
+// argIsComputed reports whether expr's value can vary between iterations:
+// either it contains a function call directly (`backoff(attempt)`), or
+// it's a plain identifier whose value was assigned, somewhere in body,
+// from an expression that contains one (`delay := backoff(attempt)`
+// followed by `time.Sleep(delay)`). Without the second case, the very
+// common pattern of computing a delay into a variable before sleeping on
+// it reads as a fixed delay and produces a false positive.
+func argIsComputed(expr ast.Expr, body ast.Node) bool {
+	if exprContainsCall(expr) {
+		return true
+	}
+	ident, ok := expr.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	return identComputedInBody(body, ident.Name)
+}
+
+// exprContainsCall reports whether expr contains a function call anywhere
+// in it. Unlike inspectShallow, this walks the full expression tree: an
 // argument expression is small and never contains a nested loop.
-func argIsComputed(expr ast.Expr) bool {
+func exprContainsCall(expr ast.Expr) bool {
 	found := false
 	ast.Inspect(expr, func(n ast.Node) bool {
 		if _, ok := n.(*ast.CallExpr); ok {
 			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// identComputedInBody reports whether name is assigned, directly inside
+// body, from an expression that contains a function call. It does not
+// follow chains of assignments (`a := b; b := backoff()`), only the
+// expression assigned to name itself.
+func identComputedInBody(body ast.Node, name string) bool {
+	found := false
+	inspectShallow(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, lhs := range assign.Lhs {
+			id, ok := lhs.(*ast.Ident)
+			if !ok || id.Name != name || i >= len(assign.Rhs) {
+				continue
+			}
+			if exprContainsCall(assign.Rhs[i]) {
+				found = true
+				return false
+			}
 		}
 		return true
 	})

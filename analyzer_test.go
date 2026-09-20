@@ -110,6 +110,40 @@ func backoff(n int) time.Duration { return time.Duration(n) * time.Second }
 			want: nil,
 		},
 		{
+			name: "sleep duration read from a variable computed via a backoff call is not fixed-delay",
+			src: `package sample
+
+import "time"
+
+func retry() {
+	for attempt := 0; attempt < 5; attempt++ {
+		delay := backoff(attempt)
+		time.Sleep(delay)
+	}
+}
+
+func backoff(n int) time.Duration { return time.Duration(n) * time.Second }
+`,
+			want: nil,
+		},
+		{
+			name: "sleep duration read from a variable assigned a fixed literal is still fixed-delay",
+			src: `package sample
+
+import "time"
+
+func retry() {
+	for attempts := 0; attempts < 5; attempts++ {
+		delay := time.Second
+		time.Sleep(delay)
+	}
+}
+`,
+			want: []Finding{
+				{Rule: "fixed-delay-no-jitter", Message: "retry delay is a fixed duration with no backoff or jitter", Line: 8, Column: 3},
+			},
+		},
+		{
 			name: "sleep duration with jitter mixed into the expression is not fixed-delay",
 			src: `package sample
 
