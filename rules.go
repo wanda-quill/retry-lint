@@ -44,18 +44,71 @@ func checkUnboundedRetry(fset *token.FileSet, loop *ast.ForStmt) []Finding {
 	}}
 }
 
-// checkFixedDelay flags time.Sleep calls, inside any loop, whose duration
-// argument contains no function call. A literal or constant expression
-// (time.Second, 2*time.Second) produces the same delay on every attempt;
-// a call (backoff(attempt), jitter(base)) is assumed to vary it.
-func checkFixedDelay(fset *token.FileSet, loop *ast.ForStmt) []Finding {
+// checkUnboundedRecursiveRetry flags a function that retries by calling
+// itself again instead of looping: it sleeps between attempts but never
+// compares anything against a limit, so recursion never bottoms out. The
+// caller must already know fn is self-recursive; this only checks the
+// sleep/bound shape, same as checkUnboundedRetry does for a for loop.
+func checkUnboundedRecursiveRetry(fset *token.FileSet, fn *ast.FuncDecl) []Finding {
+	if !containsSleepCall(fn.Body) {
+		return nil
+	}
+	if containsBoundingComparison(fn.Body) {
+		return nil
+	}
+
+	pos := fset.Position(fn.Pos())
+	return []Finding{{
+		Rule:    "unbounded-retry",
+		Message: "recursive retry has no attempt limit or bound check",
+		Line:    pos.Line,
+		Column:  pos.Column,
+	}}
+}
+
+// isSelfRecursive reports whether fn's body contains a direct call back to
+// fn by name. It does not look inside nested function literals: a callback
+// that happens to reference the enclosing function isn't the same as the
+// function retrying itself, and chasing that down would mean reasoning
+// about how the closure gets invoked, which is out of scope for syntax-only
+// analysis. Calls through a method receiver (m.fn()) aren't recognized
+// either, since the receiver could be a different value than the one the
+// call is running on.
+func isSelfRecursive(fn *ast.FuncDecl) bool {
+	found := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if found || n == nil {
+			return false
+		}
+		if _, ok := n.(*ast.FuncLit); ok {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == fn.Name.Name {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// checkFixedDelay flags time.Sleep calls, inside a retry body (a loop or a
+// self-recursive function), whose duration argument contains no function
+// call. A literal or constant expression (time.Second, 2*time.Second)
+// produces the same delay on every attempt; a call (backoff(attempt),
+// jitter(base)) is assumed to vary it.
+func checkFixedDelay(fset *token.FileSet, body ast.Node) []Finding {
 	var findings []Finding
-	inspectShallow(loop.Body, func(n ast.Node) bool {
+	inspectShallow(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || !isTimeSleepCall(call) || len(call.Args) != 1 {
 			return true
 		}
-		if argIsComputed(call.Args[0], loop.Body) {
+		if argIsComputed(call.Args[0], body) {
 			return true
 		}
 		pos := fset.Position(call.Pos())
@@ -112,15 +165,16 @@ var httpStatusConst = map[string]int{
 	"StatusTooManyRequests":              429,
 }
 
-// checkRetryOnNonRetryable flags an `if` inside a loop that recognizes a
-// non-retryable outcome (a canceled context, a 4xx response) but whose
-// body doesn't exit the loop, meaning execution falls through to the
-// retry logic anyway. The check only looks at the shape of the branch,
-// not what runs before or after it, so it catches the bug even in loops
-// that are otherwise correctly bounded and backed off.
-func checkRetryOnNonRetryable(fset *token.FileSet, loop *ast.ForStmt) []Finding {
+// checkRetryOnNonRetryable flags an `if` inside a retry body (a loop or a
+// self-recursive function) that recognizes a non-retryable outcome (a
+// canceled context, a 4xx response) but whose body doesn't exit, meaning
+// execution falls through to the retry logic anyway. The check only looks
+// at the shape of the branch, not what runs before or after it, so it
+// catches the bug even in retries that are otherwise correctly bounded and
+// backed off.
+func checkRetryOnNonRetryable(fset *token.FileSet, body ast.Node) []Finding {
 	var findings []Finding
-	inspectShallow(loop.Body, func(n ast.Node) bool {
+	inspectShallow(body, func(n ast.Node) bool {
 		ifStmt, ok := n.(*ast.IfStmt)
 		if !ok {
 			return true

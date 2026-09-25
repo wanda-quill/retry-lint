@@ -34,13 +34,21 @@ func Analyze(filename string, src []byte) ([]Finding, error) {
 
 	var findings []Finding
 	ast.Inspect(file, func(n ast.Node) bool {
-		loop, ok := n.(*ast.ForStmt)
-		if !ok {
-			return true
+		switch node := n.(type) {
+		case *ast.ForStmt:
+			findings = append(findings, checkUnboundedRetry(fset, node)...)
+			findings = append(findings, checkFixedDelay(fset, node.Body)...)
+			findings = append(findings, checkRetryOnNonRetryable(fset, node.Body)...)
+		case *ast.FuncDecl:
+			// A function that retries by calling itself again instead of
+			// looping is still a retry loop; it just doesn't look like one
+			// to anything that only inspects *ast.ForStmt.
+			if node.Body != nil && isSelfRecursive(node) {
+				findings = append(findings, checkUnboundedRecursiveRetry(fset, node)...)
+				findings = append(findings, checkFixedDelay(fset, node.Body)...)
+				findings = append(findings, checkRetryOnNonRetryable(fset, node.Body)...)
+			}
 		}
-		findings = append(findings, checkUnboundedRetry(fset, loop)...)
-		findings = append(findings, checkFixedDelay(fset, loop)...)
-		findings = append(findings, checkRetryOnNonRetryable(fset, loop)...)
 		return true
 	})
 

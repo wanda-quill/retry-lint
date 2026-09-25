@@ -19,6 +19,23 @@ review but cause real incidents in production:
 It does not type-check your code or resolve imports, so it never needs your
 module's dependencies to run — it only reads syntax.
 
+All three checks also apply to a function that retries by calling itself
+again instead of using a `for` loop:
+
+```go
+func fetchWithRetry(url string, attempt int) (*http.Response, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		time.Sleep(2 * time.Second)
+		return fetchWithRetry(url, attempt+1)
+	}
+	return resp, nil
+}
+```
+
+is reported the same way a `for` loop with the same shape would be, since
+the recursive call is standing in for the loop.
+
 ## Usage
 
 ```
@@ -57,8 +74,15 @@ dropped into a CI step the same way as `go vet`.
 
 ## What it does not catch (yet)
 
-- Retries implemented through a helper function instead of a literal
-  `for` loop with `time.Sleep` in it.
+- Retries implemented through anything other than a direct, named
+  self-call. Mutual recursion (`a` calls `b`, `b` calls `a`), a retry
+  dispatched through a passed-in callback, or a call through a method
+  receiver (`c.fetchWithRetry()`) don't look like recursion to a check
+  that only compares call names against the enclosing function's name.
+- A non-retryable branch that recurses to continue retrying instead of
+  falling through (`if canceled { return fetchWithRetry(...) }`) reads as
+  an exit, the same as `return err` would, so it isn't flagged. Only the
+  fall-through shape is caught.
 - Attempt limits expressed as `attempts == max` rather than an ordering
   comparison (`<`, `<=`, `>`, `>=`). Equality is intentionally excluded
   from the bound check, because `err == nil` and `err != nil` are the most
